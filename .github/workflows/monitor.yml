@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
 
@@ -23,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests beautifulsoup4 playwright
+      - run: pip install requests beautifulsoup4 playwright curl_cffi
 
       - name: Cache browser
         id: pwcache
@@ -40,11 +40,21 @@ jobs:
             playwright install --with-deps chromium
           fi
 
+      - name: Install virtual display
+        run: |
+          command -v xvfb-run >/dev/null || sudo apt-get install -y xvfb
+
       - name: Run monitor
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT }}
-        run: python smart_monitor.py
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          if command -v xvfb-run >/dev/null; then
+            USE_XVFB=1 xvfb-run -a --server-args="-screen 0 1366x850x24" python smart_monitor.py
+          else
+            python smart_monitor.py
+          fi
 
       - name: Save price history
         if: always()
