@@ -26,8 +26,8 @@ START = time.time()
 # ======================================================================
 
 # ---- أ) كم عرض يوصلك في اليوم كحد أقصى ----
-MAX_VERIFIED = 10        # عروض ✅ الموثّقة
-MAX_UNVERIFIED = 5       # عروض ⚠️ غير الموثّقة
+MAX_DEALS = 15          # إجمالي العروض؛ اختيار عشوائي موزّع على المتاجر
+REMOVED_STORES = {"نون", "الماجد للعود"}
 SHOW_UNVERIFIED = True   # اجعلها False لو تبغى ✅ فقط (الأنقى)
 
 # ---- ب) فئات المنتجات ----
@@ -93,15 +93,11 @@ CRAWL_STORES = [   # متاجر نقرأ أقسامها تلقائياً (فئت
      "start": ["https://3saf.com/ar"]},
     {"name": "ثنيان", "unverified_cap": 0.60, "strategies": ("requests", "cffi", "browser"),
      "start": ["https://thnyan.com/ar"]},
-    {"name": "الماجد للعود", "unverified_cap": 0.60, "strategies": ("cffi", "browser", "requests"),
-     "start": ["https://www.almajed4oud.com/", "https://www.almajed4oud.com/ar"]},
     {"name": "جولدن سنت", "unverified_cap": 0.55, "strategies": ("cffi", "browser", "requests"),
      "start": ["https://www.goldenscent.com/ar", "https://www.goldenscent.com/ar/perfumes",
                "https://www.goldenscent.com/ar/offers"]},
 ]
 SEARCH_STORES = [  # متاجر نبحث فيها بالكلمات
-    {"name": "نون", "unverified_cap": 0.45, "skip": [], "strategies": ("requests", "cffi", "browser"),
-     "url": "https://www.noon.com/saudi-ar/search/?q={q}"},
     {"name": "إكسترا", "unverified_cap": 0.45, "strategies": ("requests", "cffi", "browser"),
      "skip": ["shoes", "clothes", "hoodies", "perfumes"],
      "url": "https://www.extra.com/ar-sa/search/?text={q}"},
@@ -122,7 +118,7 @@ MAX_DISCOUNT = 0.90      # خصم أعلى من كذا غالباً خطأ في 
 HISTORY_DAYS = 90
 MAX_CRAWL_PAGES = 8
 TIME_BUDGET = 14 * 60    # ثواني؛ بعدها يوقف البحث ويرسل اللي جمعه
-HEAVY_STORE_BUDGET = 8 * 60   # أقصى وقت لكل متجر ثقيل (نون/إكسترا/علي) في اليوم
+HEAVY_STORE_BUDGET = 8 * 60   # إعداد قديم؛ الميزانية الفعلية لكل متجر داخل collect
 SITEMAP_PAGES = 8       # لو الموقع مقفول: كم منتج نقرأ من خريطة الموقع
 MIN_DELAY = 0.7          # فاصل بين الطلبات (ثواني)
 MAX_DELAY = 1.3
@@ -990,23 +986,36 @@ def message_for(candidate):
 
 
 def send_candidates(candidates, archive):
-    sent={'v':0,'u':0}; stores=Counter(); categories=Counter()
-    pending=list(candidates)
-    while pending:
-        # Greedy diversity across both stores and categories, with deal quality retained.
-        best=max(pending,key=lambda c:(c['discount']+0.08*c['verified'])/
-                 (1+0.5*stores[c['item']['store']]+0.5*categories[c['category']]))
-        pending.remove(best)
-        key='v' if best['verified'] else 'u'
-        if sent[key]>=(MAX_VERIFIED if best['verified'] else MAX_UNVERIFIED):
+    sent={'v':0,'u':0}; categories=Counter(); unique={}; buckets={}
+    for candidate in candidates:
+        it=candidate['item']
+        if it['store'] in REMOVED_STORES or not archive.can_alert(it):
             continue
-        if not archive.can_alert(best['item']):
-            continue
-        if send_telegram(message_for(best)):
-            archive.mark_alert(best['item'])
-            sent[key]+=1
-            stores[best['item']['store']]+=1
-            categories[best['category']]+=1
+        previous=unique.get(it['id'])
+        if previous is None or (candidate['verified'] and not previous['verified']):
+            unique[it['id']]=candidate
+    for candidate in unique.values():
+        buckets.setdefault(candidate['item']['store'],[]).append(candidate)
+    # One random offer per store per round. Catalog size and discount score do
+    # not give Amazon or any other store priority over the remaining stores.
+    while buckets and sum(sent.values())<MAX_DEALS:
+        order=list(buckets)
+        random.shuffle(order)
+        for store in order:
+            if sum(sent.values())>=MAX_DEALS:
+                break
+            pool=buckets[store]
+            least=min(categories[c['category']] for c in pool)
+            chosen=random.choice([c for c in pool if categories[c['category']]==least])
+            pool.remove(chosen)
+            if not pool:
+                del buckets[store]
+            if not archive.can_alert(chosen['item']):
+                continue
+            if send_telegram(message_for(chosen)):
+                archive.mark_alert(chosen['item'])
+                sent['v' if chosen['verified'] else 'u']+=1
+                categories[chosen['category']]+=1
     return sent
 
 
@@ -1014,7 +1023,7 @@ def collect(archive, run_id, selftest=False):
     global STORE_DEADLINE
     health={}; collected={}
     amazon=dict(name='أمازون السعودية',url='https://www.amazon.sa/s?k={q}',skip=[],strategies=AMAZON_STRATEGIES)
-    primary=[amazon]+[c for c in SEARCH_STORES if c['name'] in ('نون','إكسترا')]
+    primary=[amazon]+[c for c in SEARCH_STORES if c['name']=='إكسترا']
     secondary=[c for c in SEARCH_STORES if c['name']=='علي إكسبرس']+CRAWL_STORES
     day=date.today().toordinal()
     def accept(items,key):

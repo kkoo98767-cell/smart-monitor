@@ -292,5 +292,42 @@ class GitSaveTests(unittest.TestCase):
             self.assertEqual((a/'quality.db').read_bytes(),b'quality\x00new')
 
 
+class RandomDistributionTests(unittest.TestCase):
+    def candidate(self,pid,store):
+        return dict(item=item(750,1000,pid,store),category='جوالات',verified=False,
+                    discount=0.25,ref=1000,stats=dict(count=0,days=0,low=None,average=None))
+
+    def run_send(self,candidates,limit,seed):
+        import random
+        archive=Mock();archive.can_alert.return_value=True
+        with patch.object(m,'MAX_DEALS',limit),patch.object(m,'random',random.Random(seed)), \
+             patch.object(m,'message_for',side_effect=lambda c:c['item']['store']+':'+c['item']['id']), \
+             patch.object(m,'send_telegram',return_value=True) as send:
+            result=m.send_candidates(candidates,archive)
+        return result,[call.args[0] for call in send.call_args_list]
+
+    def test_each_eligible_store_gets_turn_even_without_verified_offers(self):
+        stores=['أمازون السعودية','إكسترا','علي إكسبرس','درعة','عساف','ثنيان','جولدن سنت']
+        candidates=[self.candidate(str(n),'أمازون السعودية') for n in range(100)]
+        candidates += [self.candidate('other'+str(n),store) for n,store in enumerate(stores[1:])]
+        result,messages=self.run_send(candidates,7,42)
+        self.assertEqual(result,{'v':0,'u':7})
+        self.assertEqual({text.split(':')[0] for text in messages},set(stores))
+
+    def test_random_selection_changes_with_seed(self):
+        candidates=[self.candidate(str(n),'إكسترا') for n in range(12)]
+        self.assertNotEqual(self.run_send(candidates,4,1)[1],self.run_send(candidates,4,2)[1])
+
+    def test_removed_stores_duplicates_and_total_limit(self):
+        candidates=[self.candidate(str(n),'إكسترا') for n in range(40)]
+        candidates += [candidates[0],self.candidate('noon','نون'),self.candidate('oud','الماجد للعود')]
+        result,messages=self.run_send(candidates,15,7)
+        self.assertEqual(sum(result.values()),15)
+        self.assertEqual(len(set(messages)),15)
+        self.assertTrue(all(text.startswith('إكسترا:') for text in messages))
+        active={cfg['name'] for cfg in m.CRAWL_STORES+m.SEARCH_STORES}
+        self.assertFalse(active & {'نون','الماجد للعود'})
+
+
 if __name__=='__main__':
     unittest.main()
