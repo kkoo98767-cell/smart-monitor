@@ -1,29 +1,6 @@
-"""المراقب الذكي - النسخة 5 (قراءة متعددة الطبقات)
-يشتغل مرة باليوم، ويرسل لك فقط أقوى العروض الحقيقية.
-
-الجديد في النسخة 5:
-- إصلاح قراءة السعر: ما عاد يقرأ "وفر 330" أو "رصيد جولد" أو "36 دفعة" كأنها سعر
-  (يتحقق: السعر = السعر القديم - مبلغ التوفير)
-- قراءة كل متجر بعدة طرق بالترتيب لين تنجح: طلب بنفس بصمة متصفح كروم (curl_cffi)،
-  طلب عادي، متصفح حقيقي بوضع التخفي (مع التقاط بيانات JSON الداخلية)، وأخيراً
-  خريطة الموقع (sitemap)
-- ما يرسل أي رسالة خطأ لتيليجرام. صحة المتاجر تنكتب في سجل التشغيل وملخص GitHub
-- حماية من الأسعار الغلط: قفزة سعر مستحيلة عن تاريخ المنتج تُتجاهل
-
-المتاجر: أمازون السعودية، نون، إكسترا، علي إكسبرس، درعة، عساف، ثنيان،
-         الماجد للعود، جولدن سنت
-
-✅ موثّق    = السعر أقل بوضوح من تاريخ أسعار المنتج نفسه عندنا (بعد 7 أيام جمع)
-              وقريب من أقل سعر شافه خلال 90 يوم.
-⚠️ غير موثّق = مقارنة بالسعر القديم المكتوب في المتجر فقط (حدوده أعلى بكثير
-              لأن كثير من المتاجر تكتب خصومات وهمية).
-
-المتغيرات المطلوبة (تنحط كأسرار في GitHub): TG_TOKEN و TG_CHAT
-
-╔══════════════════════════════════════════════════════════════╗
-║  وين تغيّر؟ كل شي تغيّره موجود في القسم الأول "الإعدادات"       ║
-║  تحت، ولا تحتاج تلمس أي شي بعده.                              ║
-╚══════════════════════════════════════════════════════════════╝
+"""المراقب الذكي v6: أرشيف كامل، مرجع من سجلنا، بدائل قراءة، selftest دون تيليجرام.
+التشغيل اليومي 08:07 السعودية. الإعدادات الأساسية أدناه.
+الخصم المعلن ليس إثباتاً لانخفاض السعر. التوثيق يحتاج قراءة سابقة بفاصل 12 ساعة.
 """
 import json
 import os
@@ -34,13 +11,14 @@ import statistics
 import time
 from collections import Counter
 from datetime import date, timedelta
+from monitor_history import Archive, valid_price, uniform_discount_ids
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-TG_TOKEN = os.environ["TG_TOKEN"]
-TG_CHAT = os.environ["TG_CHAT"]
+TG_TOKEN = os.environ.get("TG_TOKEN", "")
+TG_CHAT = os.environ.get("TG_CHAT", "")
 START = time.time()
 
 # ======================================================================
@@ -122,20 +100,20 @@ CRAWL_STORES = [   # متاجر نقرأ أقسامها تلقائياً (فئت
                "https://www.goldenscent.com/ar/offers"]},
 ]
 SEARCH_STORES = [  # متاجر نبحث فيها بالكلمات
-    {"name": "نون", "unverified_cap": 0.45, "skip": [], "strategies": ("browser", "cffi"),
+    {"name": "نون", "unverified_cap": 0.45, "skip": [], "strategies": ("requests", "cffi", "browser"),
      "url": "https://www.noon.com/saudi-ar/search/?q={q}"},
-    {"name": "إكسترا", "unverified_cap": 0.45, "strategies": ("browser", "cffi", "requests"),
+    {"name": "إكسترا", "unverified_cap": 0.45, "strategies": ("requests", "cffi", "browser"),
      "skip": ["shoes", "clothes", "hoodies", "perfumes"],
      "url": "https://www.extra.com/ar-sa/search/?text={q}"},
     {"name": "علي إكسبرس", "unverified_cap": 0.75, "skip": ["perfumes"],
-     "strategies": ("browser", "cffi"),
+     "strategies": ("requests", "cffi", "browser"),
      "url": "https://www.aliexpress.com/w/wholesale-{q}.html"},
 ]
 AMAZON_STRATEGIES = ("requests", "cffi", "browser")
 AMAZON_UNVERIFIED_CAP = 0.45
 
 # ---- د) حساسية التحقق ----
-MIN_HISTORY_DAYS = 7     # كم يوم أسعار نحتاج قبل ما نسمي العرض ✅
+MIN_HISTORY_DAYS = 0     # كم يوم أسعار نحتاج قبل ما نسمي العرض ✅
 NEAR_LOW = 1.03          # لازم السعر <= أقل سعر سابق × هذا الرقم
 MIN_RATING = 4.0         # (أمازون) تجاهل التقييم الأقل
 MAX_DISCOUNT = 0.90      # خصم أعلى من كذا غالباً خطأ في الصفحة
@@ -143,13 +121,13 @@ MAX_DISCOUNT = 0.90      # خصم أعلى من كذا غالباً خطأ في 
 # ---- هـ) حدود تقنية ----
 HISTORY_DAYS = 90
 MAX_CRAWL_PAGES = 8
-TIME_BUDGET = 55 * 60    # ثواني؛ بعدها يوقف البحث ويرسل اللي جمعه
+TIME_BUDGET = 14 * 60    # ثواني؛ بعدها يوقف البحث ويرسل اللي جمعه
 HEAVY_STORE_BUDGET = 8 * 60   # أقصى وقت لكل متجر ثقيل (نون/إكسترا/علي) في اليوم
-SITEMAP_PAGES = 40       # لو الموقع مقفول: كم منتج نقرأ من خريطة الموقع
-MIN_DELAY = 3.0          # فاصل بين الطلبات (ثواني)
-MAX_DELAY = 6.0
-RETRY_BASE = 10          # أول انتظار عند 503/429 (يتضاعف)
-RETRY_MAX_WAIT = 90
+SITEMAP_PAGES = 8       # لو الموقع مقفول: كم منتج نقرأ من خريطة الموقع
+MIN_DELAY = 0.7          # فاصل بين الطلبات (ثواني)
+MAX_DELAY = 1.3
+RETRY_BASE = 2          # أول انتظار عند 503/429 (يتضاعف)
+RETRY_MAX_WAIT = 10
 WEEKLY_STATUS = True     # رسالة "المراقب شغال" مرة بالأسبوع (بدون أي أخطاء)
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()   # اختياري: لو أي متجر ظل مقفول
 
@@ -163,37 +141,22 @@ HEADERS = {
 #                      2) الكود الداخلي (لا تلمسه)
 # ======================================================================
 # ============================ قاعدة البيانات ============================
-db = sqlite3.connect("monitor.db")
-db.executescript("""
-CREATE TABLE IF NOT EXISTS prices(id TEXT, day TEXT, price REAL,
-                                  PRIMARY KEY(id, day));
-CREATE TABLE IF NOT EXISTS alerted(id TEXT, price REAL, PRIMARY KEY(id, price));
-CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
-""")
-
-
-def meta_get(k):
-    r = db.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
-    return r[0] if r else None
-
-
-def meta_set(k, v):
-    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (k, v))
-    db.commit()
-
-
 # ============================ أدوات عامة ============================
 def send_telegram(text):
+    if SELFTEST:
+        return False
+    if not TG_TOKEN or not TG_CHAT:
+        print('Telegram: missing repository secrets (values never logged)')
+        return False
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": TG_CHAT, "text": text}, timeout=20)
-        if r.status_code != 200:
-            print("خطأ تيليجرام:", r.status_code, r.text[:200])
-            return False
-        return True
-    except Exception as e:
-        print("فشل الإرسال:", e)
+        response=requests.post(f'https://api.telegram.org/bot{TG_TOKEN}/sendMessage',
+            data={'chat_id':TG_CHAT,'text':text,'disable_web_page_preview':True},timeout=20)
+        success=response.status_code==200 and response.json().get('ok') is True
+        print('Telegram: delivered' if success else f'Telegram: rejected HTTP {response.status_code}')
+        return success
+    except Exception as exc:
+        # requests exceptions can contain the token in their URL: never print them.
+        print(f'Telegram: delivery failed ({type(exc).__name__})')
         return False
 
 
@@ -221,7 +184,9 @@ pace = {"now": (MIN_DELAY + MAX_DELAY) / 2, "ok": 0}
 
 
 def polite_sleep():
-    time.sleep(random.uniform(pace["now"] * 0.8, pace["now"] * 1.4))
+    remaining=time_left()
+    if remaining>0:
+        time.sleep(min(remaining,random.uniform(MIN_DELAY,MAX_DELAY)))
 
 
 def _slow():
@@ -271,7 +236,7 @@ def _fetch_with(do_get, url, tries=3):
             status, text, headers = do_get(url)
         except Exception as e:
             net["network"] += 1
-            last = f"network: {str(e)[:40]}"
+            last = f"network: {type(e).__name__}"
             if attempt == tries - 1 or time_left() < delay + 5:
                 raise Blocked(last)
             time.sleep(delay + random.uniform(0, 3))
@@ -311,7 +276,7 @@ def get_requests(url):
     def do(u):
         _req_session.headers.update(_headers(u))
         _req_session.headers["User-Agent"] = random.choice(UAS)
-        r = _req_session.get(u, timeout=30, proxies=_proxies())
+        r = _req_session.get(u, timeout=max(1,min(20,time_left())), proxies=_proxies())
         return r.status_code, r.text, r.headers
     return _fetch_with(do, url)
 
@@ -331,14 +296,14 @@ def get_cffi(url):
         sess = cr.Session(impersonate="chrome124")
         _cffi_sessions[host] = sess
         try:   # زيارة الصفحة الرئيسية أول عشان ناخذ الكوكيز
-            sess.get(f"https://{host}/", timeout=25, headers=_headers(),
+            sess.get(f"https://{host}/", timeout=max(1,min(15,time_left())), headers=_headers(),
                      proxies=_proxies())
             time.sleep(random.uniform(1, 2))
         except Exception:
             pass
 
     def do(u):
-        r = sess.get(u, timeout=30, headers=_headers(u), proxies=_proxies())
+        r = sess.get(u, timeout=max(1,min(20,time_left())), headers=_headers(u), proxies=_proxies())
         return r.status_code, r.text, r.headers
     return _fetch_with(do, url)
 
@@ -403,23 +368,23 @@ def get_browser(url):
             page.on("response", on_resp)
             page.route("**/*", lambda r: r.abort() if r.request.resource_type in
                        ("image", "font", "media") else r.continue_())
-            resp = page.goto(url, timeout=50000, wait_until="domcontentloaded")
+            resp = page.goto(url, timeout=max(1000,min(25000,int(time_left()*1000))), wait_until="domcontentloaded")
             status = resp.status if resp else 200
             for _ in range(8):          # ننتظر لو فيه صفحة "تحقق" تنحل لحالها
                 if "just a moment" not in (page.title() or "").lower():
                     break
                 page.wait_for_timeout(2000)
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=max(1000,min(5000,int(time_left()*1000))))
             except Exception:
                 pass
-            for _ in range(5):          # تمرير لتحميل المنتجات الكسولة
+            for _ in range(3):          # bounded lazy-load scrolling
                 page.mouse.wheel(0, 2500)
                 page.wait_for_timeout(700)
             html = page.content()
             extra = "".join('<script type="application/json" data-xhr="1">'
                             + b.replace("</", "<\\/") + "</script>" for b in xhr[:15])
-            if status in (403, 429, 503) and looks_blocked(html):
+            if status in (401, 403, 429, 503):
                 net[str(status)] += 1
                 raise Blocked(f"HTTP {status}")
             if looks_blocked(html) and not xhr:
@@ -429,7 +394,7 @@ def get_browser(url):
         except Blocked:
             raise
         except Exception as e:
-            last = f"browser: {str(e)[:50]}"
+            last = f"browser: {type(e).__name__}"
             net["network"] += 1
             time.sleep(3)
         finally:
@@ -458,68 +423,69 @@ SKIP_HREF = re.compile(r"(cart|login|account|wishlist|checkout|javascript:|mailt
 LOCALE_SEG = re.compile(r"^(ar|en|ar-sa|en-sa|saudi-ar|saudi-en|ar_sa|en_sa|sa-ar|sa-en|sa)$", re.I)
 
 
-def make_id(store, url):
-    segs = [x for x in urlparse(url).path.split("/") if x]
+def make_id(store,url):
+    parsed=urlparse(url)
+    if store=='أمازون السعودية':
+        match=re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})',parsed.path,re.I)
+        if match:
+            return 'amz:'+match.group(1).upper()
+    segs=[x for x in parsed.path.split('/') if x]
     while segs and LOCALE_SEG.match(segs[0]):
         segs.pop(0)
-    return f"{store}:/" + "/".join(segs).lower()
+    return store+':/'+('/'.join(segs)).lower()
 
 
 def card_prices(card):
-    """يرجع (السعر الحالي, السعر القديم). يتجاهل مبلغ التوفير والرصيد والأقساط،
-    ويتحقق: السعر الحالي = السعر القديم - مبلغ التوفير."""
-    vals, saves = set(), []
+    """Accept explicit current/old prices; never infer a sale from two arbitrary amounts."""
+    current, old_values, savings = set(), set(), set()
+    digit = re.compile(r'\d[\d,]*(?:\.\d+)?')
     for el in card.find_all(True):
-        if el.name in ("script", "style", "svg"):
+        if el.name in ('script','style','svg'):
             continue
-        txt = el.get_text(" ", strip=True)
-        if not txt or len(txt) > 45:
+        txt = el.get('content') if el.get('itemprop') == 'price' else el.get_text(' ',strip=True)
+        txt = str(txt or '').translate(str.maketrans('٠١٢٣٤٥٦٧٨٩٫٬','0123456789.,'))
+        if not txt or len(txt)>80 or len(digit.findall(txt))!=1:
             continue
-        if SAVE.search(txt):                 # مثل: "وفر 330 ر.س" -> هذا توفير مو سعر
-            n = num(txt)
-            if n and n > 0:
-                saves.append(n)
-            continue
-        if BAD.search(txt):
-            continue
-        cls = " ".join(el.get("class", [])) + " " + (el.get("id") or "")
-        is_old = el.name in ("del", "s", "strike") or bool(OLD_CLS.search(cls))
-        if not (CUR.search(txt) or PRICE_CLS.search(cls) or is_old):
-            continue
-        n = num(txt)
-        if n and n >= 5:
-            vals.add((n, is_old))
-    cur = sorted(v for v, o in vals if not o)
-    olds = [v for v, o in vals if o]
-    old = max(olds) if olds else None
-    price = None
-    if old and saves:                        # التحقق: سعر = قديم - توفير
-        for sv in saves:
-            target = old - sv
-            for c in cur:
-                if abs(c - target) <= max(1.5, old * 0.003):
-                    price = c
-                    break
-            if price is None and target > 0 and not cur:
-                price = target
-            if price is not None:
+        cls = ' '.join(el.get('class',[]))+' '+str(el.get('id',''))
+        contexts=[txt,cls]
+        is_old=el.name in ('del','s','strike') or bool(OLD_CLS.search(cls))
+        parent=el.parent
+        for _ in range(3):
+            if parent is None or parent is card:
                 break
-    if price is None and cur:
-        price = cur[0]
-        if saves and any(abs(price - sv) < 0.01 for sv in saves) and len(cur) > 1:
-            price = cur[1]
-    if price is None:
-        return None, None
-    if old is None:
-        if saves:
-            old = price + saves[0]           # القديم = الحالي + التوفير
-        elif cur and cur[-1] > price * 1.02:
-            old = cur[-1]
-    if old is not None and old <= price:
-        old = None
-    if old is not None and price < old * 0.12:   # مستحيل غالباً: خطأ قراءة
-        return None, None
-    return price, old
+            pcls=' '.join(parent.get('class',[]))
+            is_old |= parent.name in ('del','s','strike') or bool(OLD_CLS.search(pcls))
+            ptxt=parent.get_text(' ',strip=True).translate(str.maketrans('٠١٢٣٤٥٦٧٨٩٫٬','0123456789.,'))
+            if len(ptxt)<100 and len(digit.findall(ptxt))==1:
+                contexts.extend([ptxt,pcls])
+            parent=parent.parent
+        context=' '.join(contexts)
+        value=num(txt)
+        if not valid_price(value):
+            continue
+        if BAD.search(context) or re.search(r'(قسّم|قسم|دفعات|payments|credit|جود|gold|loyalty)',context,re.I):
+            continue
+        if SAVE.search(context):
+            savings.add(value)
+            continue
+        if not (CUR.search(txt) or PRICE_CLS.search(cls) or is_old or el.get('itemprop')=='price'):
+            continue
+        (old_values if is_old else current).add(value)
+    old=max(old_values) if old_values else None
+    if old and savings:
+        matches={v for v in current for saving in savings
+                 if abs(v-(old-saving))<=max(0.05,old*0.0001)}
+        if len(matches)==1:
+            return matches.pop(),old
+    # Multiple unlabelled amounts are ambiguous (credit, bundles, instalments).
+    current-=old_values
+    current-=savings
+    if len(current)!=1:
+        return None,None
+    price=current.pop()
+    if old and price<old*0.12:
+        return None,None
+    return price,old if old and old>price else None
 
 
 def tile_items(soup, base, store):
@@ -529,7 +495,7 @@ def tile_items(soup, base, store):
         if SKIP_HREF.search(href):
             continue
         url = urljoin(base, href).split("#")[0]
-        if urlparse(url).netloc != urlparse(base).netloc and "noon" not in store:
+        if urlparse(url).netloc != urlparse(base).netloc:
             continue
         card, found = a, None
         for _ in range(5):
@@ -547,7 +513,9 @@ def tile_items(soup, base, store):
         if not found:
             continue
         price, old, card = found
-        title = (a.get("title") or a.get_text(" ", strip=True) or "").strip()
+        heading = card.find(["h2", "h3", "h4"])
+        title = (a.get("title") or (heading.get_text(" ", strip=True) if heading else "")
+                 or a.get_text(" ", strip=True) or "").strip()
         if len(title) < 4:
             img = card.find("img", alt=True)
             title = (img["alt"] if img else "").strip()
@@ -585,6 +553,12 @@ def jsonld_items(soup, base, store):
                 offers = d.get("offers") or {}
                 if isinstance(offers, list):
                     offers = offers[0] if offers else {}
+                currency = offers.get("priceCurrency")
+                availability = str(offers.get("availability", ""))
+                if currency and str(currency).upper() != "SAR":
+                    continue
+                if "OutOfStock" in availability or "SoldOut" in availability:
+                    continue
                 price = num(offers.get("price") or offers.get("lowPrice"))
                 url = d.get("url") or offers.get("url")
                 if price and url and d.get("name"):
@@ -630,70 +604,95 @@ def _to_price(v):
     return None
 
 
-def walk_products(data, base, store, out, limit=300000):
-    stack, seen = [data], 0
-    while stack and seen < limit:
-        d = stack.pop()
-        seen += 1
-        if isinstance(d, list):
-            stack.extend(d)
+def walk_products(data, base, store, out, limit=100000):
+    stack,seen=[data],0
+    while stack and seen<limit:
+        d=stack.pop(); seen+=1
+        if isinstance(d,list):
+            stack.extend(d); continue
+        if not isinstance(d,dict):
             continue
-        if not isinstance(d, dict):
-            continue
-        price = next((p for p in (_to_price(d.get(k)) for k in PRICE_KEYS if k in d) if p), None)
-        name = next((str(d[k]) for k in NAME_KEYS
-                     if isinstance(d.get(k), str) and len(d[k]) >= 4), None)
-        link = next((str(d[k]) for k in URL_KEYS
-                     if isinstance(d.get(k), str) and len(d[k]) >= 3), None)
-        if price and name and link:
-            if not link.startswith("http"):
-                link = urljoin(base, link if link.startswith("/") else "/" + link)
-            old = next((p for p in (_to_price(d.get(k)) for k in OLD_KEYS if k in d)
-                        if p and p > price), None)
-            if old is None and "price" in d:       # sale_price موجود، و"price" هو القديم
-                op = _to_price(d.get("price"))
-                if op and op > price * 1.001:
-                    old = op
-            pid = make_id(store, link)
-            rating = None
-            for rk in ("rating", "product_rating", "average_rating", "avgRating"):
-                rv = d.get(rk)
-                rating = _to_price(rv.get("value")) if isinstance(rv, dict) else None
-                if rating:
-                    break
-            if pid not in out or (old and not out[pid]["old"]):
-                out[pid] = {"id": pid, "title": name[:150], "price": price, "old": old,
-                            "rating": None, "url": link.split("#")[0], "store": store}
         stack.extend(d.values())
+        if 'aliexpress.com' in base and d.get('productId') and isinstance(d.get('prices'),dict):
+            prices=d['prices']; sale=prices.get('salePrice') or {}; original=prices.get('originalPrice') or {}
+            title=d.get('title') or {}
+            # This adapter is based on the actual captured SAR search payload.
+            if sale.get('currencyCode')=='SAR' and isinstance(title,dict):
+                link='https://www.aliexpress.com/item/'+str(d['productId'])+'.html'
+                pid=make_id(store,link); price=_to_price(sale.get('minPrice'))
+                old=_to_price(original.get('minPrice')) if original.get('currencyCode')=='SAR' else None
+                if price and title.get('displayTitle'):
+                    out[pid]=dict(id=pid,title=title['displayTitle'][:150],price=price,
+                        old=old if old and old>price else None,rating=None,url=link,store=store)
+        name=next((d[k] for k in NAME_KEYS if isinstance(d.get(k),str) and len(d[k])>=4),None)
+        if not name:
+            continue
+        sku=d.get('sku') or d.get('sku_code') or d.get('code') or d.get('productId')
+        link=next((d[k] for k in URL_KEYS if isinstance(d.get(k),str) and len(d[k])>=3),None)
+        if 'noon.com' in base and sku:
+            if not link:
+                link=f'/saudi-ar/{sku}/p/'
+            elif '/p/' not in link and str(sku) not in link:
+                link=f'/saudi-ar/{link.strip("/")}/{sku}/p/'
+        if not link:
+            continue
+        link=urljoin(base,link if link.startswith(('/','http')) else '/'+link)
+        if urlparse(link).hostname!=urlparse(base).hostname:
+            continue
+        if 'aliexpress.com' in base and '/item/' not in link:
+            continue
+        currency=d.get('currency') or d.get('currencyIso')
+        price_obj=d.get('price')
+        if isinstance(price_obj,dict):
+            currency=price_obj.get('currencyIso') or price_obj.get('currency') or currency
+        if currency and str(currency).upper() not in ('SAR','SR','ر.س'):
+            continue
+        price=next((p for p in (_to_price(d.get(k)) for k in PRICE_KEYS) if p),None)
+        if not price:
+            offers=d.get('offers')
+            if isinstance(offers,dict):
+                price=_to_price(offers.get('price'))
+        if not valid_price(price):
+            continue
+        old=next((p for p in (_to_price(d.get(k)) for k in OLD_KEYS) if p and p>price),None)
+        if old is None and any(d.get(k) is not None for k in PRICE_KEYS if k!='price'):
+            regular=_to_price(d.get('price'))
+            if regular and regular>price:
+                old=regular
+        if old and price<old*0.12:
+            continue
+        legacy=make_id(store,link)
+        pid=f'{store}:sku:{sku}' if sku and store=='نون' else legacy
+        rating=d.get('rating') or d.get('product_rating')
+        if isinstance(rating,dict):
+            rating=rating.get('value') or rating.get('average')
+        rating=_to_price(rating)
+        item=dict(id=pid,legacy_id=legacy,title=name[:150],price=price,old=old,
+                  rating=rating if rating and rating<=5 else None,url=link,store=store)
+        if pid not in out or (old and not out[pid].get('old')):
+            out[pid]=item
 
 
-def json_state_items(soup, base, store):
-    out = {}
-    decoder = json.JSONDecoder()
-    for sc in soup.find_all("script"):
-        raw = sc.string or sc.get_text() or ""
-        if len(raw) < 40:
+def json_state_items(soup,base,store):
+    out={}; decoder=json.JSONDecoder()
+    for sc in soup.find_all('script'):
+        raw=sc.string or sc.get_text() or ''
+        if len(raw)<30 or 'ld+json' in str(sc.get('type','')):
             continue
-        typ = (sc.get("type") or "").lower()
-        if "ld+json" in typ:
-            continue
-        data = None
-        if "json" in typ or sc.get("id") in ("__NEXT_DATA__", "__NUXT_DATA__"):
+        if 'json' in str(sc.get('type','')) or sc.get('id') in ('__NEXT_DATA__','__NUXT_DATA__'):
             try:
-                data = json.loads(raw)
-            except Exception:
-                data = None
-        if data is not None:
-            walk_products(data, base, store, out)
-            continue
-        if not re.search(r'"(price|sale_price|salePrice|special_price)"', raw):
-            continue
-        for m in list(re.finditer(r"=\s*([\[{])", raw))[:6]:   # window.__STATE__ = {...}
-            try:
-                obj, _ = decoder.raw_decode(raw, m.start(1))
-            except Exception:
-                continue
-            walk_products(obj, base, store, out)
+                walk_products(json.loads(raw),base,store,out)
+            except (ValueError,TypeError):
+                pass
+        # Decode JSON literals only; never eval JavaScript from a store page.
+        patterns=[r'=\s*([\[{])',r'\bdata\s*:\s*({)',r'dispatchEvents\(\s*({)']
+        for pattern in patterns:
+            for match in list(re.finditer(pattern,raw))[:12]:
+                try:
+                    obj,_=decoder.raw_decode(raw,match.start(1))
+                    walk_products(obj,base,store,out)
+                except (ValueError,TypeError):
+                    pass
     return out
 
 
@@ -714,7 +713,7 @@ def shopify_items(origin, store):
                         "old": old if old and old > price else None, "rating": None,
                         "url": url, "store": store}
     except Exception as e:
-        print("shopify:", str(e)[:60])
+        print("shopify:", safe_error(e))
     return out
 
 
@@ -748,23 +747,43 @@ def discover_links(soup, base, limit):
     return found
 
 
-def get_items(url, store, strategies=("requests", "cffi", "browser")):
-    """نجرب الطرق بالترتيب، وأول طريقة تطلع منتجات فعلاً نعتمدها."""
-    errs = []
-    for st in strategies:
-        if time_left() <= 0:
+def get_items(url, store, strategies=('requests','cffi','browser')):
+    errors=[]
+    for method in strategies:
+        if time_left()<=1:
             break
         try:
-            html = STRATS[st](url)
-        except Exception as e:
-            errs.append(f"{st}: {str(e)[:35]}")
-            continue
-        items, soup = parse_page(html, url, store)
-        if items:
-            won.setdefault(store, Counter())[st] += 1
-            return items, soup
-        errs.append(f"{st}: 0 منتج")
-    raise Blocked(" | ".join(errs) or "no strategy")
+            html=STRATS[method](url)
+            if html.lstrip().startswith(('{','[')):
+                items={}; walk_products(json.loads(html),url,store,items)
+                soup=None
+            else:
+                items,soup=parse_page(html,url,store)
+            items={pid:it for pid,it in items.items() if valid_price(it.get('price'))
+                   and (not it.get('old') or it['price']>=it['old']*0.12)}
+            # Next.js route is derived from an actual build ID, never a guessed API.
+            if not items and soup and method!='browser':
+                sc=soup.find('script',id='__NEXT_DATA__')
+                if sc:
+                    state=json.loads(sc.string or sc.get_text())
+                    build=state.get('buildId')
+                    if build and re.fullmatch(r'[A-Za-z0-9_-]+',str(build)):
+                        u=urlparse(url)
+                        endpoint=f'{u.scheme}://{u.netloc}/_next/data/{build}{u.path.rstrip("/") or "/index"}.json'
+                        if u.query:
+                            endpoint+='?'+u.query
+                        payload=STRATS[method](endpoint)
+                        walk_products(json.loads(payload),url,store,items)
+                        method+=':next-data'
+            if items:
+                won.setdefault(store,Counter())[method]+=1
+                for it in items.values():
+                    it['method']=method
+                return items,soup
+            errors.append(f'{method}: zero products; schema/page requires review')
+        except Exception as exc:
+            errors.append(f'{method}: {safe_error(exc)}')
+    raise Blocked(' | '.join(errors) or 'time budget exhausted')
 
 
 def fetch_text(url):
@@ -905,217 +924,266 @@ def search_store(cfg, keywords):
     return out
 
 
-# ============================ منطق العروض ============================
-candidates = []   # كل العروض اللي نجحت، نرتبها ونرسل الأقوى فقط
-seen_items = 0
-suspect = {"n": 0}
-
-
-def clean_ok(item, cat):
-    if not item["price"] or item["price"] < cat["min_price"]:
-        return False
-    if re.search(cat["exclude"], item["title"], re.I):
-        return False
-    if item.get("rating") and item["rating"] < MIN_RATING:
-        return False
-    return True
-
-
-def evaluate(item, vmin, umin):
-    """يرجع (خصم, سعر_مرجعي, موثّق) أو None."""
-    today = date.today().isoformat()
-    since = (date.today() - timedelta(days=HISTORY_DAYS)).isoformat()
-    past = [r[0] for r in db.execute(
-        "SELECT price FROM prices WHERE id=? AND day>=? AND day<? ORDER BY day",
-        (item["id"], since, today))]
-    if len(past) >= MIN_HISTORY_DAYS:
-        # نتجاهل آخر 7 أيام إذا عندنا تاريخ كافي، عشان رفع السعر قبل العرض ما ينحسب
-        base = past[:-7] if len(past) >= 14 else past
-        ref = min(statistics.median(base), statistics.median(past))
-        discount = 1 - item["price"] / ref
-        if vmin <= discount <= MAX_DISCOUNT and item["price"] <= min(past) * NEAR_LOW:
-            return discount, ref, True
-        return None
-    if SHOW_UNVERIFIED and item["old"] and item["old"] > item["price"]:
-        discount = 1 - item["price"] / item["old"]
-        if umin <= discount <= MAX_DISCOUNT:
-            return discount, item["old"], False
-    return None
-
-
-def handle(items, cat, unverified_cap):
-    global seen_items
-    today = date.today().isoformat()
-    for it in items:
-        if not it["price"]:
-            continue
-        # أسعار مستحيلة = خطأ قراءة: توفير مقروء كسعر، أو سعر أقل بكثير من القديم
-        if it.get("old") and it["price"] < it["old"] * 0.12:
-            suspect["n"] += 1
-            continue
-        past_all = [r[0] for r in db.execute(
-            "SELECT price FROM prices WHERE id=? AND day>=?",
-            (it["id"], (date.today() - timedelta(days=HISTORY_DAYS)).isoformat()))]
-        if len(past_all) >= 2 and it["price"] < statistics.median(past_all) * 0.25:
-            suspect["n"] += 1          # نزول 75%+ فجأة عن تاريخ المنتج = غالباً خطأ قراءة
-            continue
-        seen_items += 1
-        # نسجل السعر دايماً (حتى لو المنتج مستبعد) لبناء التاريخ
-        result = evaluate(it, cat["verified_min"],
-                          max(cat["unverified_min"], unverified_cap)) \
-            if clean_ok(it, cat) else None
-        db.execute("INSERT OR REPLACE INTO prices VALUES(?,?,?)",
-                   (it["id"], today, it["price"]))
-        if not result:
-            continue
-        discount, ref, verified = result
-        if db.execute("SELECT 1 FROM alerted WHERE id=? AND price=?",
-                      (it["id"], it["price"])).fetchone():
-            continue
-        saving = ref - it["price"]
-        candidates.append({
-            "item": it, "cat": cat["name"], "discount": discount, "ref": ref,
-            "verified": verified, "score": discount + min(saving / 2000, 0.2)})
-    db.commit()
-
 
 def time_left():
-    return TIME_BUDGET - (time.time() - START)
+    return max(0,min(START+TIME_BUDGET,STORE_DEADLINE)-time.time())
+
+def safe_error(exc):
+    message=str(exc)
+    for secret in (TG_TOKEN,PROXY_URL):
+        if secret:
+            message=message.replace(secret,'[redacted]')
+    message=re.sub(r'https?://\S+', '[URL]', message)
+    return message[:200]
+
+# Unified thresholds. Legacy per-category thresholds above are retained for reference
+# but no longer override these settings.
+MIN_DEAL_DISCOUNT = 0.25
+MIN_VERIFIED_DISCOUNT = 0.25
+MIN_HISTORY_HOURS = 12
+SELFTEST = False
+STORE_DEADLINE = float('inf')
+EXTRA_KEYWORDS = {
+ 'phones':['iPhone 16','Samsung Galaxy S25','Google Pixel','هاتف هونر'],
+ 'ps_controller':['DualSense Edge','يد بلايستيشن 5 سوني'],
+ 'tv':['تلفزيون LG OLED','Samsung QLED','TCL 65'],
+ 'gaming_monitor':['LG UltraGear','Samsung Odyssey','شاشة 240Hz'],
+ 'headphones':['Sony WH-1000XM5','AirPods Pro','JBL سماعات'],
+ 'pc':['Logitech G502','Samsung 990 PRO SSD','Corsair DDR5'],
+ 'home':['Dyson مكنسة','Philips Airfryer','غسالة ال جي'],
+ 'shoes':['Nike Air Max','Adidas Ultraboost','New Balance رجالي'],
+ 'clothes':['قميص بولو رجالي','بنطلون جينز رجالي'],
+ 'hoodies':['Nike hoodie men','Adidas هودي رجالي'],
+ 'perfumes':['عود طبيعي','دهن عود','Dior Sauvage','عطر عساف','عطر ثنيان']}
+for _key,_words in EXTRA_KEYWORDS.items():
+    CATEGORIES[_key]['keywords'] += [w for w in _words if w not in CATEGORIES[_key]['keywords']]
+
+def clean_ok(item, cat):
+    return (valid_price(item.get('price')) and item['price']>=cat['min_price']
+            and not re.search(cat['exclude'],item['title'],re.I)
+            and (not item.get('rating') or item['rating']>=MIN_RATING))
 
 
-def send_candidates():
-    sent = {"v": 0, "u": 0}
-    best = {}
-    for c in candidates:   # نفس المنتج قد يظهر في أكثر من بحث: نخلي أفضل نسخة
-        k = c["item"]["id"]
-        if k not in best or (c["verified"], c["score"]) > (best[k]["verified"], best[k]["score"]):
-            best[k] = c
-    for c in sorted(best.values(), key=lambda c: -c["score"]):
-        key = "v" if c["verified"] else "u"
-        if sent[key] >= (MAX_VERIFIED if c["verified"] else MAX_UNVERIFIED):
+def message_for(candidate):
+    it=candidate['item']; st=candidate['stats']
+    badge=('✅ موثّق: انخفض عن السعر المرجعي الذي سجلناه.' if candidate['verified']
+           else '⚠️ غير موثّق: خصم معلن من المتجر؛ لم نثبت انخفاضه من سجلنا.')
+    history=(f"السجل السابق: {st['count']} قراءة خلال {st['days']:.1f} يوم؛ "
+             f"الأقل {st['low']:.2f}، المتوسط {st['average']:.2f} ريال.\n" if st['count']
+             else 'السجل السابق: لا توجد قراءة مؤهلة بفاصل 12 ساعة.\n')
+    return (f"{badge}\n{it['title']}\n🏬 {it['store']} | {candidate['category']}\n"
+            f"💰 {it['price']:.2f} ريال | المرجع {candidate['ref']:.2f}\n"
+            f"📉 توفير {candidate['ref']-it['price']:.2f} ريال ({candidate['discount']:.1%})\n"
+            +history+it['url'])
+
+
+def send_candidates(candidates, archive):
+    sent={'v':0,'u':0}; stores=Counter(); categories=Counter()
+    pending=list(candidates)
+    while pending:
+        # Greedy diversity across both stores and categories, with deal quality retained.
+        best=max(pending,key=lambda c:(c['discount']+0.08*c['verified'])/
+                 (1+0.5*stores[c['item']['store']]+0.5*categories[c['category']]))
+        pending.remove(best)
+        key='v' if best['verified'] else 'u'
+        if sent[key]>=(MAX_VERIFIED if best['verified'] else MAX_UNVERIFIED):
             continue
-        it = c["item"]
-        badge = ("✅ موثّق (من تاريخ الأسعار)" if c["verified"]
-                 else "⚠️ غير موثّق (مقارنة بسعر المتجر فقط)")
-        ok = send_telegram(
-            f"🔥 {it['title']}\n"
-            f"🏷️ {c['cat']}  |  🏬 {it['store']}\n"
-            f"💰 {it['price']:.0f} ريال (قبل: {c['ref']:.0f})\n"
-            f"📉 خصم {c['discount']:.0%}  {badge}\n"
-            + (f"⭐ التقييم: {it['rating']}\n" if it.get("rating") else "")
-            + f"🛒 {it['url']}")
-        if ok:
-            sent[key] += 1
-            db.execute("INSERT OR IGNORE INTO alerted VALUES(?,?)",
-                       (it["id"], it["price"]))
-    db.commit()
+        if not archive.can_alert(best['item']):
+            continue
+        if send_telegram(message_for(best)):
+            archive.mark_alert(best['item'])
+            sent[key]+=1
+            stores[best['item']['store']]+=1
+            categories[best['category']]+=1
     return sent
 
 
-# ============================ التشغيل ============================
-def main():
-    today = date.today().isoformat()
-    db.execute("DELETE FROM prices WHERE day < ?",
-               ((date.today() - timedelta(days=HISTORY_DAYS + 30)).isoformat(),))
-    if not meta_get("hello"):
-        if send_telegram("✅ المراقب الذكي اشتغل وتيليجرام متصل.\n"
-                         "يشتغل مرة باليوم ويرسل لك فقط أقوى العروض.\n"
-                         "✅ = موثّق من تاريخ الأسعار\n"
-                         "⚠️ = غير موثّق (مقارنة بسعر المتجر فقط)\n"
-                         "أول 7 أيام يجمع الأسعار، فالعروض تكون ⚠️ وبحدود عالية."):
-            meta_set("hello", today)
-
-    health = {}
-    cat_order = list(CATEGORIES.items())
-    k = date.today().toordinal() % len(cat_order)
-    cat_order = cat_order[k:] + cat_order[:k]      # تدوير يومي: ما تتضرر نفس الفئات
-
-    # أمازون
-    n, err = 0, None
-    for key, cat in cat_order:
-        for kw in cat["keywords"]:
-            if time_left() < 0:
-                break
+def collect(archive, run_id, selftest=False):
+    global STORE_DEADLINE
+    health={}; collected={}
+    amazon=dict(name='أمازون السعودية',url='https://www.amazon.sa/s?k={q}',skip=[],strategies=AMAZON_STRATEGIES)
+    primary=[amazon]+[c for c in SEARCH_STORES if c['name'] in ('نون','إكسترا')]
+    secondary=[c for c in SEARCH_STORES if c['name']=='علي إكسبرس']+CRAWL_STORES
+    day=date.today().toordinal()
+    def accept(items,key):
+        for item in items:
+            if archive.observe(item,key,run_id):
+                item['category_key']=key
+                collected[item['id']]=item
+    for cfg in primary+secondary:
+        store=cfg['name']
+        # Primary stores cannot starve one another; secondary attempts stay bounded.
+        budget=(90 if selftest else 210) if cfg in primary else (35 if selftest else 30)
+        if store=='علي إكسبرس':
+            budget=45 if selftest else 60
+        STORE_DEADLINE=min(START+TIME_BUDGET,time.time()+budget)
+        before=set(collected); errors=[]
+        def read(url):
+            if store=='أمازون السعودية':
+                # Search HTML uses Amazon's stable ASIN selector; PDP uses JSON-LD.
+                if '/s?' in url:
+                    items=fetch_amazon_url(url)
+                    return items
+            items,_=get_items(url,store,cfg.get('strategies',('requests','cffi','browser')))
+            return list(items.values())
+        if 'start' in cfg:
             try:
-                items = fetch_amazon(kw)
-                handle(items, cat, AMAZON_UNVERIFIED_CAP)
-                n += len(items)
-            except Exception as e:
-                err = str(e)[:90]
-            polite_sleep()
-    health["أمازون السعودية"] = (n, err)
-
-    # متاجر العطور والعود
-    for cfg in CRAWL_STORES:
-        if time_left() < 0:
-            health[cfg["name"]] = (0, "انتهى وقت التشغيل")
-            continue
-        try:
-            items = crawl_store(cfg)
-            handle(items, CATEGORIES["perfumes"], cfg["unverified_cap"])
-            health[cfg["name"]] = (len(items), None)
-        except Exception as e:
-            health[cfg["name"]] = (0, str(e)[:90])
-
-    # المتاجر الثقيلة (لكل متجر ميزانية وقت)
-    for cfg in SEARCH_STORES:
-        n, err, t0 = 0, None, time.time()
-        for key, cat in cat_order:
-            if key in cfg["skip"]:
-                continue
-            for kw in cat["keywords"]:
-                if time_left() < 0 or time.time() - t0 > HEAVY_STORE_BUDGET:
-                    break
+                accept(crawl_store(cfg),'perfumes')
+            except Exception as exc:
+                errors.append(safe_error(exc))
+        else:
+            order=[k for k in CATEGORIES if k not in cfg.get('skip',[])]
+            shift=day%len(order)
+            order=order[shift:]+order[:shift]
+            tasks=[]
+            # Revisit least recently seen archived products; avoids a discovery-only archive.
+            if not selftest:
+                tasks.extend((key,url) for key,url in archive.db.execute('''
+                    SELECT category,url FROM products WHERE store=? AND url<>''
+                    AND category<>'' ORDER BY last_seen LIMIT 3''',(store,)) if key in CATEGORIES)
+            rounds=1 if selftest else max(len(CATEGORIES[k]['keywords']) for k in order)
+            for round_no in range(rounds):
+                for key in order:
+                    words=CATEGORIES[key]['keywords']
+                    if round_no>=len(words):
+                        continue
+                    keyword=words[(day+round_no)%len(words)]
+                    query=keyword.replace(' ','-') if store=='علي إكسبرس' else quote_plus(keyword)
+                    tasks.append((key,cfg['url'].format(q=query)))
+            failures=0
+            for key,url in tasks:
+                if time_left()<=2:
+                    errors.append('store time budget reached'); break
                 try:
-                    items = search_store(cfg, [kw])
-                    handle(items, cat, cfg["unverified_cap"])
-                    n += len(items)
-                except Exception as e:
-                    err = str(e)[:90]
-        health[cfg["name"]] = (n, err)
+                    accept(read(url),key)
+                    failures=0
+                except Exception as exc:
+                    failures+=1
+                    errors.append(safe_error(exc))
+                    if failures>=2:
+                        errors.append('circuit stopped after two failed URLs'); break
+                polite_sleep()
+            if not any(i['store']==store for i in collected.values()) and time_left()>5:
+                # Retains sitemap fallback for search stores as well.
+                try:
+                    origin='{u.scheme}://{u.netloc}'.format(u=urlparse(cfg['url']))
+                    recovered=sitemap_items(origin,store,cfg['strategies'])
+                    # Unknown category is archived, but never promoted to a deal.
+                    accept(list(recovered.values()),'')
+                except Exception as exc:
+                    errors.append('sitemap: '+safe_error(exc))
+        new=[collected[k] for k in set(collected)-before]
+        health[store]={'count':len(new),'methods':dict(won.get(store,{})),
+                       'examples':[dict(title=i['title'],price=i['price'],old=i.get('old'),
+                                        url=i['url'],method=i.get('method','unknown')) for i in new[:3]],
+                       'errors':errors[-5:]}
+        if not new:
+            health[store]['note']='No usable products. 403/challenge may require PROXY_URL; not proof that every method is blocked on GitHub.'
+        print(store,json.dumps(health[store],ensure_ascii=False))
+    STORE_DEADLINE=START+TIME_BUDGET
+    return list(collected.values()),health
 
-    sent = send_candidates()
 
-    # صحة المتاجر: في السجل وملخص GitHub فقط (ما نرسل أخطاء لتيليجرام)
-    lines = []
-    for name, (n, err) in health.items():
-        how = ", ".join(f"{k}×{v}" for k, v in won.get(name, {}).items())
-        lines.append(f"OK  {name}: {n} منتج" + (f" [{how}]" if how else "") if n
-                     else f"--  {name}: 0 ({err or 'بدون سبب'})")
-    report = "\n".join(lines)
-    print(report)
-    print("أخطاء الشبكة:", dict(net), "| أسعار مشبوهة تم تجاهلها:", suspect["n"])
-    summ = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summ:
+def fetch_amazon_url(url):
+    errors=[]
+    for method in AMAZON_STRATEGIES:
+        if time_left()<=1:
+            break
         try:
-            with open(summ, "a", encoding="utf8") as f:
-                f.write("### صحة المتاجر\n```\n" + report + "\n```\n")
-        except Exception:
-            pass
+            html=STRATS[method](url)
+            items=_parse_amazon(BeautifulSoup(html,'html.parser'))
+            if items:
+                won.setdefault('أمازون السعودية',Counter())[method]+=1
+                for it in items:
+                    it['method']=method
+                return items
+            errors.append(method+': zero ASIN cards')
+        except Exception as exc:
+            errors.append(method+': '+safe_error(exc))
+    raise Blocked(' | '.join(errors) or 'time budget reached')
 
-    stores_ok = sum(1 for n, _ in health.values() if n)
-    total_read = sum(n for n, _ in health.values())
-    last = meta_get("last_status")
-    due = True
-    if last:
+
+def main():
+    global SELFTEST,START,STORE_DEADLINE
+    import argparse
+    import shutil
+    import tempfile
+    import uuid
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--selftest',action='store_true')
+    parser.add_argument('--telegram-check',action='store_true')
+    parser.add_argument('--db',default='monitor.db')
+    args=parser.parse_args()
+    SELFTEST=args.selftest
+    START=time.time(); STORE_DEADLINE=START+TIME_BUDGET
+    run_id=str(uuid.uuid4())
+    temp=tempfile.TemporaryDirectory() if SELFTEST else None
+    path=args.db
+    if temp:
+        path=os.path.join(temp.name,'selftest.db')
+        if os.path.exists(args.db):
+            # SQLite backup also works if source uses a WAL journal.
+            source=sqlite3.connect(args.db); target=sqlite3.connect(path)
+            source.backup(target); target.close(); source.close()
+    archive=Archive(path)
+    try:
+        if args.telegram_check and not SELFTEST:
+            # Explicit connection check uses only the existing permitted heartbeat text.
+            if send_telegram('🟢 المراقب الذكي شغال'):
+                archive.set_meta('last_status',date.today().isoformat())
+            else:
+                print('Telegram check failed; see status above. No diagnostics sent to Telegram.')
+        items,health=collect(archive,run_id,SELFTEST)
+        campaign_ids=uniform_discount_ids(items)
+        candidates=[]
+        for item in items:
+            cat=CATEGORIES.get(item.get('category_key'))
+            if not cat or not clean_ok(item,cat):
+                continue
+            result=archive.evaluate(item,run_id,item['id'] in campaign_ids,
+                min_discount=MIN_DEAL_DISCOUNT,verified_discount=MIN_VERIFIED_DISCOUNT,
+                min_hours=MIN_HISTORY_HOURS)
+            if result and (result['verified'] or SHOW_UNVERIFIED):
+                candidates.append(dict(item=item,category=cat['name'],**result))
+        sent=send_candidates(candidates,archive) if not SELFTEST else {'v':0,'u':0}
+        last=archive.get_meta('last_status')
         try:
-            due = (date.today() - date.fromisoformat(last)).days >= 7
+            due=not last or (date.today()-date.fromisoformat(last)).days>=7
         except ValueError:
-            due = True
-    if WEEKLY_STATUS and stores_ok and due:
-        send_telegram(f"🟢 المراقب الذكي شغال\nقرأ {total_read} منتج من {stores_ok} متجر اليوم.\n"
-                      "ما يوصلك إلا العروض القوية الحقيقية.")
-        meta_set("last_status", today)
-
-    if _browser is not None:
-        try:
+            due=True
+        if not SELFTEST and WEEKLY_STATUS and items and due:
+            if send_telegram('🟢 المراقب الذكي شغال'):
+                archive.set_meta('last_status',date.today().isoformat())
+        elapsed=round(time.time()-START,1)
+        report=dict(mode='selftest' if SELFTEST else 'monitor',stores=health,
+                    unique_accepted=len(items),eligible=len(candidates),sent=sent,
+                    rejected=archive.db.execute('SELECT COUNT(*) FROM rejected_readings WHERE run_id=?',(run_id,)).fetchone()[0],
+                    elapsed_seconds=elapsed,network=dict(net))
+        with open('monitor_report.json','w',encoding='utf8') as f:
+            json.dump(report,f,ensure_ascii=False,indent=2)
+        summary=os.environ.get('GITHUB_STEP_SUMMARY')
+        if summary:
+            with open(summary,'a',encoding='utf8') as f:
+                f.write('### Smart Monitor '+report['mode']+'\n\n')
+                for store,status in health.items():
+                    f.write(f"- {store}: {status['count']} products; methods {status['methods']}\n")
+                    for ex in status['examples']:
+                        f.write(f"  - {ex['title']}: SAR {ex['price']}; old {ex['old']}; {ex['method']}\n")
+                    for error in status['errors']:
+                        f.write('  - '+error.replace('\n',' ')+'\n')
+                f.write(f"\nElapsed {elapsed}s. Sent verified {sent['v']}, unverified {sent['u']}.\n")
+        print(json.dumps(report,ensure_ascii=False))
+        # Zero reads is a failed run, not a successful empty catalog.
+        return 0 if items else 2
+    finally:
+        archive.close()
+        if temp:
+            temp.cleanup()
+        if _browser is not None:
             _browser.close()
+        if _pw is not None:
             _pw.stop()
-        except Exception:
-            pass
-    print(f"انتهى. فحص {seen_items} منتج، أُرسل ✅{sent['v']} ⚠️{sent['u']}، "
-          f"المدة {int(time.time() - START)} ثانية")
 
 
-if __name__ == "__main__":
-    main()
+if __name__=='__main__':
+    raise SystemExit(main())
