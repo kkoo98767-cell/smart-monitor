@@ -160,6 +160,18 @@ class ReaderTests(unittest.TestCase):
         out={};m.walk_products(data,'https://www.extra.com','إكسترا',out)
         self.assertEqual(next(iter(out.values()))['price'],1319)
 
+    def test_extra_captured_search_json_ignores_membership_credit_instalment(self):
+        # Field names and values captured from the live Extra search response,
+        # 2026-11-16. This is a reduced fixture, not an invented endpoint/schema.
+        data=dict(title='DualSense 5 Charging Station',productCode='100207275',
+            productUrl='https://www.extra.com/en-sa/electronic-games/accessories/charger/dualsense-5-charging-station/p/100207275',
+            currency='SAR',price=75,sellingPrice=75,wasPrice=149,
+            basicPrimePrice=73,basicWalletCredits=2,priceValueTasheel=4,
+            priceValueDiscountPercentage=49.66)
+        out={};m.walk_products(data,'https://www.extra.com/ar-sa/search/?text=dualsense','إكسترا',out)
+        it=next(iter(out.values()))
+        self.assertEqual((it['price'],it['old']),(75,149))
+
     def test_fallback_after_zero_and_blocked_method(self):
         good='<script type="application/json">'+json.dumps(dict(name='Test Product',url='/p/1',price=100))+'</script>'
         calls=[]
@@ -238,6 +250,7 @@ class ReaderTests(unittest.TestCase):
                 os.chdir(tmp)
                 with patch('sys.argv',['smart_monitor.py','--selftest','--telegram-check','--db',path]), \
                      patch.object(m,'collect',return_value=([dict(item(),category_key='phones')],{})), \
+                     patch.dict(os.environ,{'GITHUB_STEP_SUMMARY':''}), \
                      patch.object(m.requests,'post') as post:
                     self.assertEqual(m.main(),0)
                 post.assert_not_called()
