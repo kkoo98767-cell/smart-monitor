@@ -759,8 +759,7 @@ def get_items(url, store, strategies=('requests','cffi','browser')):
                 soup=None
             else:
                 items,soup=parse_page(html,url,store)
-            items={pid:it for pid,it in items.items() if valid_price(it.get('price'))
-                   and (not it.get('old') or it['price']>=it['old']*0.12)}
+            items={pid:it for pid,it in items.items() if usable_item(it)}
             # Next.js route is derived from an actual build ID, never a guessed API.
             if not items and soup and method!='browser':
                 sc=soup.find('script',id='__NEXT_DATA__')
@@ -935,6 +934,19 @@ def safe_error(exc):
             message=message.replace(secret,'[redacted]')
     message=re.sub(r'https?://\S+', '[URL]', message)
     return message[:200]
+
+def usable_item(item):
+    if not valid_price(item.get('price')):
+        return False
+    if item.get('old') and item['price']<item['old']*0.12:
+        return False
+    title=re.sub(r'\s+',' ',item.get('title','')).strip().lower()
+    if title in ('عرض المنتج','مشاهدة المنتج','view product','shop now','add to cart','أضف للسلة'):
+        return False
+    path=urlparse(item['url']).path.lower()
+    if item['store']=='نون' and not path.startswith(('/saudi-ar/','/saudi-en/')):
+        return False
+    return True
 
 # Unified thresholds. Legacy per-category thresholds above are retained for reference
 # but no longer override these settings.

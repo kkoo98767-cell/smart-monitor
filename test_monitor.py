@@ -220,6 +220,14 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(items)
         self.assertIn('/_next/data/abc123/saudi-ar/search.json?q=x',get.call_args.args[0])
 
+    def test_noon_uae_region_and_generic_goldenscent_tile_rejected(self):
+        it=item(200,1000,store='نون');it['url']='https://www.noon.com/uae-en/product/N123/p/'
+        self.assertFalse(m.usable_item(it))
+        it['url']='https://www.noon.com/saudi-ar/product/N123/p/'
+        self.assertTrue(m.usable_item(it))
+        it['title']='عرض المنتج'
+        self.assertFalse(m.usable_item(it))
+
     def test_selftest_main_keeps_database_and_sends_nothing(self):
         import hashlib
         with tempfile.TemporaryDirectory() as tmp:
